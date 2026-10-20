@@ -1,0 +1,108 @@
+name: Build T3 Code Preview IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: pingdotgg/t3code branch, tag or commit
+        required: true
+        default: main
+      bundle_id:
+        description: Bundle identifier for the Personal Team build
+        required: true
+        default: com.pathetic.t3code.preview
+
+env:
+  NODE_OPTIONS: --max-old-space-size=8192
+  APP_VARIANT: preview
+  EXPO_NO_GIT_STATUS: "1"
+  T3CODE_IOS_PERSONAL_TEAM: "1"
+  T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID: ${{ inputs.bundle_id }}
+
+jobs:
+  ipa:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout T3 Code
+        uses: actions/checkout@v6
+        with:
+          repository: pingdotgg/t3code
+          ref: ${{ inputs.ref }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Select newest Xcode
+        run: |
+          xcode="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: |
+            args:
+              - --filter=@t3tools/mobile...
+              - --filter=@t3tools/scripts...
+
+      - name: Expose pnpm
+        run: |
+          pnpm_version="$(node --print "require('./package.json').packageManager.split('@').pop()")"
+          vp_pnpm_bin="$HOME/.vite-plus/package_manager/pnpm/$pnpm_version/pnpm/bin"
+          echo "$vp_pnpm_bin" >> "$GITHUB_PATH"
+
+      - name: Public T3 Connect config
+        run: cp .env.example .env
+
+      - name: Prebuild iOS project
+        working-directory: apps/mobile
+        run: pnpm exec expo prebuild --clean --platform ios
+
+      - name: Build unsigned app
+        working-directory: apps/mobile/ios
+        run: |
+          workspace="$(ls -d *.xcworkspace | head -1)"
+          scheme="${workspace%.xcworkspace}"
+          echo "Building scheme $scheme"
+          set -o pipefail
+          xcodebuild \
+            -workspace "$workspace" \
+            -scheme "$scheme" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination generic/platform=iOS \
+            -derivedDataPath "$RUNNER_TEMP/dd" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build | tee "$RUNNER_TEMP/xcodebuild.log" | grep -E "error:|warning: .*deprecated|\*\* BUILD" || true
+          test -d "$RUNNER_TEMP"/dd/Build/Products/Release-iphoneos/*.app
+
+      - name: Package IPA
+        run: |
+          app="$(ls -d "$RUNNER_TEMP"/dd/Build/Products/Release-iphoneos/*.app | head -1)"
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$app" "$RUNNER_TEMP/ipa/Payload/"
+          sha="$(git rev-parse --short HEAD)"
+          (cd "$RUNNER_TEMP/ipa" && zip -qry "$GITHUB_WORKSPACE/T3CodePreview-$sha-unsigned.ipa" Payload)
+          ls -lh "$GITHUB_WORKSPACE"/*.ipa
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" -c "Print :CFBundleShortVersionString" "$app/Info.plist"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: t3code-preview-ipa
+          path: "*.ipa"
+          retention-days: 30
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
