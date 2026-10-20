@@ -59,6 +59,22 @@ jobs:
       - name: Public T3 Connect config
         run: cp .env.example .env
 
+      # `import("react-native")` makes Metro enumerate every react-native export,
+      # which constructs PushNotificationIOS. Personal Team builds have no push
+      # native module, so that throws and kills the app on the Threads screen.
+      - name: Patch dynamic react-native imports
+        working-directory: apps/mobile/src/features/updates
+        run: |
+          perl -0pi -e '
+            s/^/import { AppState } from "react-native";\n/;
+            s/\n[ \t]*const \{ AppState \} = await import\("react-native"\);//g;
+            s/import\("react-native"\)\.then\(\(\{ AppState \}\) =>/Promise.resolve().then(() =>/g;
+          ' app-updates.ts
+          if grep -rnE '(await |void |[(=] *)import\("react-native"\)' ../../; then
+            echo "dynamic react-native import still present" >&2
+            exit 1
+          fi
+
       - name: Prebuild iOS project
         working-directory: apps/mobile
         run: pnpm exec expo prebuild --clean --platform ios
